@@ -4,6 +4,8 @@ import {
   ReactFlowProvider,
   Background,
   BackgroundVariant,
+  ConnectionMode,
+  MarkerType,
   useReactFlow,
   type Node,
   type Edge,
@@ -13,21 +15,36 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Plus, Maximize2, Minimize2, Crosshair, StickyNote } from "lucide-react";
+import {
+  Plus,
+  Maximize2,
+  Minimize2,
+  Crosshair,
+  Undo2,
+  Redo2,
+  Workflow,
+  Sparkles,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
 import { useProjectStore } from "@/features/project/stores/project-store";
-import { useCanvasStore, type CanvasNode } from "../stores/canvas-store";
-import { NoteNode, type NoteNodeData } from "./note-node";
-import { NoteInspector } from "./note-inspector";
+import { useCanvasStore } from "../stores/canvas-store";
+import { defaultSize, type ShapeKind } from "../lib/shapes";
+import { DiagramShapeNode, type DiagramNodeData } from "./diagram-shape-node";
+import { ShapePalette, SHAPE_DND_MIME } from "./shape-palette";
+import { FormatPanel } from "./format-panel";
+import { DiagramChatSidebar } from "./diagram-chat-sidebar";
+import { DiagramAiInput } from "./diagram-ai-input";
 
-const nodeTypes = { note: NoteNode };
+const nodeTypes = { shape: DiagramShapeNode };
+
+function variantToRfType(v: string): string {
+  return v === "bezier" ? "default" : v; // xyflow: default=bezier; straight/step/smoothstep as-is
+}
 
 export function CanvasPanel() {
   const fullscreen = useCanvasStore.use.fullscreen();
   const { setFullscreen } = useCanvasStore.use.actions();
 
-  // The same canvas surface is rendered inside a Dialog when fullscreen is on,
-  // otherwise inline. We toss away the inline tree while fullscreen so we
-  // never have two ReactFlow instances competing for state at once.
   const surface = (
     <ReactFlowProvider>
       <CanvasSurface fullscreen={fullscreen} onToggleFullscreen={() => setFullscreen(!fullscreen)} />
@@ -48,7 +65,7 @@ export function CanvasPanel() {
           className="fixed top-12 left-6 right-6 bottom-6 rounded-xl border border-[var(--border-default)] bg-[var(--bg-base)] overflow-hidden flex flex-col shadow-[var(--shadow-overlay)] focus:outline-none"
           style={{ zIndex: "var(--z-modal)" as unknown as number }}
         >
-          <Dialog.Title className="sr-only">Spaces</Dialog.Title>
+          <Dialog.Title className="sr-only">Diagram</Dialog.Title>
           {surface}
         </Dialog.Content>
       </Dialog.Portal>
@@ -69,20 +86,27 @@ function CanvasSurface({
   const storeProjectPath = useCanvasStore.use.projectPath();
   const nodes = useCanvasStore.use.nodes();
   const edges = useCanvasStore.use.edges();
-  const selectedId = useCanvasStore.use.selectedId();
+  const selectedIds = useCanvasStore.use.selectedIds();
+  const selectedEdgeId = useCanvasStore.use.selectedEdgeId();
   const loaded = useCanvasStore.use.loaded();
+  const chatOpen = useCanvasStore.use.chatOpen();
   const {
     loadProject,
-    addNote,
-    moveNote,
-    deleteNote,
+    addShape,
+    moveNode,
+    resizeNode,
+    deleteNodes,
     addEdge,
     deleteEdge,
-    setSelected,
+    setSelectedIds,
+    setSelectedEdge,
     setViewport,
+    beginInteraction,
+    setChatOpen,
+    undo,
+    redo,
   } = useCanvasStore.use.actions();
 
-  // Load when the project changes.
   useEffect(() => {
     if (!projectPath) return;
     if (storeProjectPath !== projectPath) {
@@ -91,84 +115,148 @@ function CanvasSurface({
   }, [projectPath, storeProjectPath, loadProject]);
 
   const rf = useReactFlow();
+
+  // Fit the view after the AI applies a batch of ops.
+  useEffect(() => {
+    const onApplied = () => {
+      requestAnimationFrame(() => rf.fitView({ duration: 400, padding: 0.2 }));
+    };
+    window.addEventListener("atlas:diagram-applied", onApplied);
+    return () => window.removeEventListener("atlas:diagram-applied", onApplied);
+  }, [rf]);
+
   const wrapperRef = useRef<HTMLDivElement>(null);
 
-  // Project store data → xyflow shape.
-  const rfNodes = useMemo<Node<NoteNodeData>[]>(
+  const rfNodes = useMemo<Node<DiagramNodeData>[]>(
     () =>
       nodes.map((n) => ({
         id: n.id,
-        type: "note",
+        type: "shape",
         position: { x: n.x, y: n.y },
-        selected: n.id === selectedId,
+        width: n.width,
+        height: n.height,
+        selected: selectedIds.includes(n.id),
+        zIndex: n.z,
+        style: { width: n.width, height: n.height },
         data: {
-          title: n.title,
+          shape: n.shape,
+          label: n.label,
           body: n.body,
-          updatedAt: n.updatedAt,
+          fill: n.fill,
+          stroke: n.stroke,
+          strokeWidth: n.strokeWidth,
+          textColor: n.textColor,
+          fontSize: n.fontSize,
+          width: n.width,
+          height: n.height,
         },
-        // We disable connections-from-everywhere; handles on the node provide them.
-        draggable: true,
       })),
-    [nodes, selectedId]
-  );
-  const rfEdges = useMemo<Edge[]>(
-    () =>
-      edges.map((e) => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        type: "smoothstep",
-        style: { stroke: "rgba(255,255,255,0.25)", strokeWidth: 1.5 },
-      })),
-    [edges]
+    [nodes, selectedIds],
   );
 
-  // Apply position changes back to the store.
+  const rfEdges = useMemo<Edge[]>(
+    () =>
+      edges.map((e) => {
+        const stroke = e.stroke ?? "rgba(255,255,255,0.42)";
+        const withArrow = e.arrow === "end" || e.arrow === "both";
+        return {
+          id: e.id,
+          source: e.source,
+          target: e.target,
+          sourceHandle: e.sourceHandle ?? undefined,
+          targetHandle: e.targetHandle ?? undefined,
+          type: variantToRfType(e.variant),
+          label: e.label,
+          selected: e.id === selectedEdgeId,
+          markerEnd: withArrow ? { type: MarkerType.ArrowClosed, color: stroke } : undefined,
+          markerStart:
+            e.arrow === "both" ? { type: MarkerType.ArrowClosed, color: stroke } : undefined,
+          style: {
+            stroke,
+            strokeWidth: 1.6,
+            strokeDasharray: e.dashed ? "6 4" : undefined,
+          },
+        };
+      }),
+    [edges, selectedEdgeId],
+  );
+
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       for (const c of changes) {
         if (c.type === "position" && c.position) {
-          moveNote(c.id, c.position.x, c.position.y);
+          moveNode(c.id, c.position.x, c.position.y);
+        } else if (c.type === "dimensions" && c.dimensions && "resizing" in c && c.resizing) {
+          resizeNode(c.id, c.dimensions.width, c.dimensions.height);
         } else if (c.type === "remove") {
-          deleteNote(c.id);
-        } else if (c.type === "select") {
-          if (c.selected) setSelected(c.id);
+          deleteNodes([c.id]);
         }
       }
     },
-    [moveNote, deleteNote, setSelected]
+    [moveNode, resizeNode, deleteNodes],
   );
 
   const onEdgesChange = useCallback(
     (changes: EdgeChange[]) => {
-      for (const c of changes) {
-        if (c.type === "remove") deleteEdge(c.id);
-      }
+      for (const c of changes) if (c.type === "remove") deleteEdge(c.id);
     },
-    [deleteEdge]
+    [deleteEdge],
   );
 
   const onConnect = useCallback(
     (c: Connection) => {
-      if (c.source && c.target) addEdge(c.source, c.target);
+      if (c.source && c.target) {
+        addEdge(c.source, c.target, {
+          sourceHandle: c.sourceHandle,
+          targetHandle: c.targetHandle,
+        });
+      }
     },
-    [addEdge]
+    [addEdge],
   );
 
-  const handleAddNote = useCallback(() => {
-    // Drop new notes near the current viewport center so they're visible.
-    const wrap = wrapperRef.current;
-    if (!wrap) {
-      addNote();
-      return;
-    }
-    const rect = wrap.getBoundingClientRect();
-    const center = rf.screenToFlowPosition({
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-    });
-    addNote({ x: center.x - 160, y: center.y - 60 });
-  }, [rf, addNote]);
+  // Multi-select comes through onSelectionChange (guarded to avoid feedback).
+  const onSelectionChange = useCallback(
+    ({ nodes: selN, edges: selE }: { nodes: Node[]; edges: Edge[] }) => {
+      const ids = selN.map((n) => n.id);
+      const cur = useCanvasStore.getState().selectedIds;
+      const same = ids.length === cur.length && ids.every((id, i) => id === cur[i]);
+      if (!same) setSelectedIds(ids);
+      const eid = selE[0]?.id ?? null;
+      if (eid !== useCanvasStore.getState().selectedEdgeId) setSelectedEdge(eid);
+    },
+    [setSelectedIds, setSelectedEdge],
+  );
+
+  const addAtCenter = useCallback(
+    (shape: ShapeKind) => {
+      const wrap = wrapperRef.current;
+      const size = defaultSize(shape);
+      if (!wrap) {
+        addShape(shape);
+        return;
+      }
+      const rect = wrap.getBoundingClientRect();
+      const center = rf.screenToFlowPosition({
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+      });
+      addShape(shape, { x: center.x - size.w / 2, y: center.y - size.h / 2 });
+    },
+    [rf, addShape],
+  );
+
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      const kind = e.dataTransfer.getData(SHAPE_DND_MIME) as ShapeKind;
+      if (!kind) return;
+      const pos = rf.screenToFlowPosition({ x: e.clientX, y: e.clientY });
+      const size = defaultSize(kind);
+      addShape(kind, { x: pos.x - size.w / 2, y: pos.y - size.h / 2 });
+    },
+    [rf, addShape],
+  );
 
   const handleFit = useCallback(() => {
     if (nodes.length === 0) return;
@@ -176,105 +264,133 @@ function CanvasSurface({
   }, [rf, nodes.length]);
 
   const onMoveEnd = useCallback(
-    (_: unknown, vp: { x: number; y: number; zoom: number }) => {
-      setViewport(vp);
-    },
-    [setViewport]
+    (_: unknown, vp: { x: number; y: number; zoom: number }) => setViewport(vp),
+    [setViewport],
   );
 
-  const jumpToNode = useCallback(
-    (id: string) => {
-      const n = (useCanvasStore.getState().nodes as CanvasNode[]).find((nn) => nn.id === id);
-      if (!n) return;
-      rf.setCenter(n.x + 160, n.y + 60, { duration: 350, zoom: rf.getZoom() });
+  // Undo/redo keyboard, scoped to the canvas wrapper.
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) redo();
+        else undo();
+      }
     },
-    [rf]
+    [undo, redo],
   );
 
   if (!projectPath) {
     return (
       <div className="h-full flex flex-col items-center justify-center text-[12px] text-text-tertiary gap-2 px-6 text-center">
-        <StickyNote size={18} className="opacity-60" />
+        <Workflow size={18} className="opacity-60" />
         <div>No project open.</div>
-        <div className="text-[10px]">Spaces are per-project. Open a folder to start a board.</div>
+        <div className="text-[10px]">Diagrams are per-project. Open a folder to start.</div>
       </div>
     );
   }
 
   return (
     <div className="h-full flex flex-col bg-bg-base">
-      {/* Header */}
+      {/* Header / toolbar */}
       <div className="flex items-center justify-between gap-2 px-3 h-[32px] shrink-0 border-b border-border-default">
         <div className="flex items-center gap-2">
-          <span className="text-[11px] text-text-secondary font-medium">Spaces</span>
-          <span className="text-[10px] text-text-tertiary">· {nodes.length} notes</span>
+          <span className="text-[11px] text-text-secondary font-medium">Diagram</span>
+          <span className="text-[10px] text-text-tertiary">· {nodes.length} shapes</span>
         </div>
         <div className="flex items-center gap-0.5">
           <button
-            onClick={handleAddNote}
+            onClick={() => addAtCenter("rounded")}
             className="flex items-center gap-1.5 px-2 h-6 rounded text-[11px] text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors cursor-pointer"
-            title="Add note"
+            title="Add shape"
           >
-            <Plus size={11} />
-            Note
+            <Plus size={11} /> Shape
           </button>
-          <button
-            onClick={handleFit}
-            className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer"
-            title="Fit to view"
-          >
-            <Crosshair size={11} />
+          <div className="mx-1 h-4 w-px bg-border-subtle" />
+          <button onClick={undo} className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer" title="Undo (⌘Z)">
+            <Undo2 size={12} />
           </button>
+          <button onClick={redo} className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer" title="Redo (⌘⇧Z)">
+            <Redo2 size={12} />
+          </button>
+          <button onClick={handleFit} className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer" title="Fit to view">
+            <Crosshair size={12} />
+          </button>
+          <button onClick={onToggleFullscreen} className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer" title={fullscreen ? "Exit fullscreen" : "Fullscreen"}>
+            {fullscreen ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+          </button>
+          <div className="mx-1 h-4 w-px bg-border-subtle" />
           <button
-            onClick={onToggleFullscreen}
-            className="p-1 rounded hover:bg-bg-hover text-text-tertiary hover:text-text-primary transition-colors cursor-pointer"
-            title={fullscreen ? "Exit fullscreen" : "Fullscreen"}
+            onClick={() => setChatOpen(!chatOpen)}
+            className={cn(
+              "flex items-center gap-1.5 px-2 h-6 rounded text-[11px] transition-colors cursor-pointer",
+              chatOpen
+                ? "text-text-primary bg-bg-selected"
+                : "text-text-secondary hover:text-text-primary hover:bg-bg-hover",
+            )}
+            title="AI copilot"
           >
-            {fullscreen ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
+            <Sparkles size={11} /> AI
           </button>
         </div>
       </div>
 
-      {/* Canvas + inspector */}
-      <div ref={wrapperRef} className="flex-1 min-h-0 relative">
-        {!loaded && (
-          <div className="absolute inset-0 flex items-center justify-center text-[11px] text-text-tertiary">
-            Loading…
-          </div>
-        )}
+      <div className="flex flex-1 min-h-0">
+        <ShapePalette onAdd={addAtCenter} />
 
-        <ReactFlow
-          nodes={rfNodes}
-          edges={rfEdges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onPaneClick={() => setSelected(null)}
-          onMoveEnd={onMoveEnd}
-          nodeTypes={nodeTypes}
-          minZoom={0.2}
-          maxZoom={2}
-          fitView={false}
-          defaultViewport={useCanvasStore.getState().viewport}
-          deleteKeyCode={["Backspace", "Delete"]}
-          proOptions={{ hideAttribution: true }}
-          panOnScroll
+        <div
+          ref={wrapperRef}
+          className="flex-1 min-h-0 relative outline-none"
+          tabIndex={0}
+          onKeyDown={onKeyDown}
+          onDrop={onDrop}
+          onDragOver={(e) => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "copy";
+          }}
         >
-          <Background
-            variant={BackgroundVariant.Dots}
-            gap={20}
-            size={1.2}
-            color="rgba(255,255,255,0.18)"
-          />
-        </ReactFlow>
+          {!loaded && (
+            <div className="absolute inset-0 flex items-center justify-center text-[11px] text-text-tertiary">
+              Loading…
+            </div>
+          )}
 
-        {selectedId && (
-          <NoteInspector onClose={() => setSelected(null)} onJumpToNode={jumpToNode} />
-        )}
+          <ReactFlow
+            nodes={rfNodes}
+            edges={rfEdges}
+            nodeTypes={nodeTypes}
+            connectionMode={ConnectionMode.Loose}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onConnect={onConnect}
+            onSelectionChange={onSelectionChange}
+            onNodeDragStart={() => beginInteraction()}
+            onPaneClick={() => {
+              setSelectedIds([]);
+              setSelectedEdge(null);
+            }}
+            onMoveEnd={onMoveEnd}
+            minZoom={0.2}
+            maxZoom={2}
+            fitView={false}
+            defaultViewport={useCanvasStore.getState().viewport}
+            deleteKeyCode={["Backspace", "Delete"]}
+            proOptions={{ hideAttribution: true }}
+            selectionOnDrag
+            panOnScroll
+          >
+            <Background variant={BackgroundVariant.Dots} gap={20} size={1.2} color="rgba(255,255,255,0.14)" />
+          </ReactFlow>
+
+          <FormatPanel />
+          <DiagramAiInput />
+        </div>
+
+        {chatOpen && <DiagramChatSidebar />}
       </div>
     </div>
   );
 }
 
-// Keep the named export the rest of the app already imports.
 export { CanvasPanel as default };

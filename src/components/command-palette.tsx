@@ -7,7 +7,7 @@ import { KbdCombo } from "@/ui/kbd";
 import { AtlasIcon } from "@/components/atlas-icon";
 import {
   MessageSquare,
-  Map,
+  Workflow,
   Globe,
   CheckSquare,
   Terminal,
@@ -126,7 +126,7 @@ export function CommandPalette({
       { id: "new-model-chat", label: "New Chat", icon: MessageSquare, category: "Open", action: () => openTab("model-chat", "Chat") },
       { id: "new-terminal", label: "New Terminal", shortcut: "⌘⇧T", icon: Terminal, category: "Open", action: () => openTab("terminal", "Terminal") },
       { id: "new-editor", label: "New Untitled Editor", shortcut: "⌘N", icon: Code, category: "Open", action: () => openTab("editor", "Untitled") },
-      { id: "new-canvas", label: "New Spaces", icon: Map, category: "Open", action: () => openTab("canvas", "Spaces") },
+      { id: "new-canvas", label: "New Diagram", icon: Workflow, category: "Open", action: () => openTab("canvas", "Diagram") },
       { id: "new-browser", label: "Open Browser", icon: Globe, category: "Open", action: () => openTab("browser", "Browser") },
       { id: "new-tasks", label: "Task Board", icon: CheckSquare, category: "Open", action: () => openTab("tasks", "Tasks") },
       { id: "new-research", label: "Research", icon: BookOpen, category: "Open", action: () => openTab("research", "Research") },

@@ -39,7 +39,6 @@ import { useChatStore } from "@/features/chat/stores/chat-store";
 import { useShallow } from "zustand/react/shallow";
 import {
   MessageSquare,
-  Map,
   Globe,
   Loader2,
   Code,
@@ -60,13 +59,14 @@ import {
   FileText,
   Columns2,
   LayoutDashboard,
+  Workflow,
 } from "lucide-react";
 import type { TabType } from "@/lib/constants";
 
 const tabIcons: Record<TabType, React.ElementType> = {
   chat: AtlasIcon,
   "model-chat": MessageSquare,
-  canvas: Map,
+  canvas: Workflow,
   browser: Globe,
   tasks: CheckSquare,
   editor: Code,
@@ -578,7 +578,7 @@ const NEW_TAB_OPTIONS: Array<{ type: TabType; label: string; icon: React.Element
   { type: "chat", label: "Agents", icon: AtlasIcon },
   { type: "model-chat", label: "Chat", icon: MessageSquare },
   { type: "terminal", label: "Terminal", icon: Terminal },
-  { type: "canvas", label: "Spaces", icon: Map },
+  { type: "canvas", label: "Diagram", icon: Workflow },
   { type: "browser", label: "Browser", icon: Globe },
   { type: "research", label: "Research", icon: BookOpen },
   { type: "knowledge", label: "Knowledge", icon: Brain },
