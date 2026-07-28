@@ -459,6 +459,7 @@ pub fn run() {
             commands::agents::agents_kill,
             commands::agents::agents_new_session,
             commands::agents::agents_load_session,
+            commands::agents::agents_replay_transcript,
             commands::agents::agents_snapshot,
             commands::agents::agents_send,
             commands::agents::agents_cancel,

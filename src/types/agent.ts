@@ -206,6 +206,18 @@ export interface ChatSession {
    * this window so navigation never flashes the empty page.
    */
   transcriptLoading?: boolean;
+  /**
+   * True between the OPTIMISTIC bind of a resumed session and the moment the
+   * backend has actually loaded it (agent spawn + ACP `session/load`).
+   *
+   * Resume paints the transcript from disk long before the session is sendable
+   * (see `resumeSessionFast`), so `acpSessionId` being set is no longer proof
+   * that Rust knows about the session — sending in that window would hit a
+   * session the manager never installed. `handleSend` treats this exactly like
+   * "not bound yet" and queues the prompt; the drain effect flushes it when the
+   * flag clears.
+   */
+  resumePending?: boolean;
 }
 
 export interface ChatMessage {

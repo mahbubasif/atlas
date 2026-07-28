@@ -281,6 +281,9 @@ interface ChatActions {
     setDisconnected: (sessionId: string, on: boolean) => void;
     setSessionTitle: (sessionId: string, title: string) => void;
     setTranscriptLoading: (sessionId: string, loading: boolean) => void;
+    /** Mark a resumed session as bound-but-not-yet-loaded. See
+     *  `ChatSession.resumePending` — gates sending, not reading. */
+    setResumePending: (sessionId: string, pending: boolean) => void;
     clearSession: (sessionId: string) => void;
     removeSession: (sessionId: string) => void;
     /** Drop several sessions at once (used when a workspace is DISCARDED from
@@ -779,6 +782,11 @@ export const useChatStore = createSelectors(
             const session = s.sessions[sessionId];
             if (session) session.transcriptLoading = loading;
           }),
+        setResumePending: (sessionId, pending) =>
+          set((s) => {
+            const session = s.sessions[sessionId];
+            if (session) session.resumePending = pending;
+          }),
         clearSession: (sessionId) =>
           set((s) => {
             const session = s.sessions[sessionId];
@@ -797,6 +805,14 @@ export const useChatStore = createSelectors(
               session.currentTurnSeq = 0;
               session.livePlan = undefined;
               session.turnScratch = undefined;
+              // The tab no longer points at the session being resumed, so the
+              // send gate must drop with it. A resume that gets superseded
+              // (New chat / another sidebar click) bails WITHOUT clearing its own
+              // flag — deliberately, so it can't un-gate the resume that replaced
+              // it — which makes this the single place the flag is guaranteed to
+              // reset. Leaving it set would silently queue every future send in
+              // this tab forever.
+              session.resumePending = false;
             }
             delete s.queues[sessionId];
           }),

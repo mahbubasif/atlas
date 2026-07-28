@@ -18,6 +18,7 @@ import type {
   ImageAttachment,
   PluginSpec,
   SessionKey,
+  SessionMessage,
   SessionSnapshot,
 } from "@/types/agents";
 
@@ -50,6 +51,17 @@ export const agents = {
     invoke<SessionKey>("agents_new_session", { agentId, cwd }),
   loadSession: (agentId: AgentId, sessionId: AcpSessionId, cwd: string) =>
     invoke<SessionKey>("agents_load_session", { agentId, sessionId, cwd }),
+
+  /** Read a saved session's transcript straight off disk — no agent spawn, no
+   *  `session/load` round-trip. Used to paint a resumed thread immediately
+   *  while the real (slow) bind runs concurrently. Resolves to `[]` for agents
+   *  with no on-disk transcript (Codex), meaning "no fast path available". */
+  replayTranscript: (pluginId: string, sessionId: AcpSessionId, cwd: string) =>
+    invoke<SessionMessage[]>("agents_replay_transcript", {
+      pluginId,
+      sessionId,
+      cwd,
+    }),
 
   snapshot: (key: SessionKey) =>
     invoke<SessionSnapshot>("agents_snapshot", { key }),

@@ -4,9 +4,14 @@ import { useLayoutStore } from "@/features/layout/stores/layout-store";
 import { useChatStore } from "@/features/chat/stores/chat-store";
 import { useProjectStore } from "@/features/project/stores/project-store";
 import { useWorkspaceStore } from "@/features/workspaces/stores/workspace-store";
-import { agents, ensureDefaultAgent, getDefaultAgentSync } from "./agents-api";
+import {
+  agents,
+  ensureDefaultAgent,
+  getDefaultAgentSync,
+  DEFAULT_PLUGIN_ID,
+} from "./agents-api";
 import { invalidateLoad } from "./load-tokens";
-import { snapshotMessageToWire } from "./snapshot-message";
+import { resumeSessionFast } from "./resume-session";
 
 /** Active project root, preferring the legacy `currentProject` but falling back
  *  to the active workspace path (mirrors the sidebar's `cwd` resolution). */
@@ -63,6 +68,7 @@ export async function openAgentSession({ acpSessionId, title, cwd }: OpenOpts): 
     setSessionTitle,
     clearSession,
     setTranscriptLoading,
+    setResumePending,
     replaceMessages,
     hydrateSessionSnapshot,
   } = chat.actions;
@@ -124,18 +130,32 @@ export async function openAgentSession({ acpSessionId, title, cwd }: OpenOpts): 
   setSessionTitle(targetTabId, title.slice(0, 40));
   const cached = getDefaultAgentSync();
   if (cached) setAcpBinding(targetTabId, cached.agent_id, acpSessionId, cwd);
+  // The binding above is optimistic — gate sends until the backend really has
+  // the session (see `ChatSession.resumePending`).
+  setResumePending(targetTabId, true);
   setTranscriptLoading(targetTabId, true);
   try {
-    const agent = await ensureDefaultAgent();
-    const key = await agents.loadSession(agent.agent_id, acpSessionId, cwd);
-    const snapshot = await agents.snapshot(key);
-    replaceMessages(targetTabId, snapshot.messages.map(snapshotMessageToWire));
+    // Two-stage: paint from disk in ~50ms, bind the agent concurrently. See
+    // `resumeSessionFast` for why the old single-await chain felt slow.
+    const { agent, snapshot } = await resumeSessionFast({
+      pluginId: DEFAULT_PLUGIN_ID,
+      sessionId: acpSessionId,
+      cwd,
+      ensure: ensureDefaultAgent,
+      cb: {
+        paint: (msgs) => replaceMessages(targetTabId, msgs),
+        onPainted: () => setTranscriptLoading(targetTabId, false),
+        isStale: () => false,
+      },
+    });
     setAcpBinding(targetTabId, agent.agent_id, acpSessionId, cwd);
     // Restore live status + docked plan AFTER the bind (which clears the plan).
     hydrateSessionSnapshot(targetTabId, snapshot.status, snapshot.plan);
     setTranscriptLoading(targetTabId, false);
+    setResumePending(targetTabId, false);
   } catch (err) {
     setTranscriptLoading(targetTabId, false);
+    setResumePending(targetTabId, false);
     toast.error(
       `Couldn't open session: ${err instanceof Error ? err.message : String(err)}`,
     );

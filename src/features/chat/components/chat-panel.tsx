@@ -433,6 +433,7 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
   // appears, no error message, no lost message.
   const prevStatusRef = useRef<string | null>(null);
   const prevAcpRef = useRef<string | undefined>(undefined);
+  const prevResumingRef = useRef(false);
   const handleSendRef = useRef<
     ((content: string, mentions: MentionData[]) => void) | null
   >(null);
@@ -458,9 +459,16 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
     const curAcp = session?.acpSessionId;
     const prevAcp = prevAcpRef.current;
     prevAcpRef.current = curAcp;
+    // A resumed session is bound optimistically, so `acpSessionId` appears long
+    // before the backend can accept a prompt. Track the resume flag separately —
+    // its falling edge is the real "sendable now" signal for that path.
+    const curResuming = !!session?.resumePending;
+    const prevResuming = prevResumingRef.current;
+    prevResumingRef.current = curResuming;
     const turnFinished = prev === "running" && cur !== "running";
     const justBound = !prevAcp && !!curAcp;
-    if (turnFinished || justBound) {
+    const justResumed = prevResuming && !curResuming && !!curAcp;
+    if (turnFinished || justBound || justResumed) {
       const next = useChatStore.getState().actions.shiftQueue(tabId);
       if (next && handleSendRef.current) {
         // Defer one microtask so the React commit completes first.
@@ -471,7 +479,7 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
     }
     // Next-step chips are extracted from the agent's own `<next_steps>` block in
     // the chat-store `turn_finished` reducer — nothing to do here.
-  }, [session?.status, session?.acpSessionId, tabId]);
+  }, [session?.status, session?.acpSessionId, session?.resumePending, tabId]);
 
   // Suggestion chips (and other adaptive affordances) send as the next message.
   // This is a GLOBAL window event and every mounted ChatPanel hears it, so only
@@ -547,7 +555,11 @@ export function ChatPanel({ tabId }: ChatPanelProps) {
       }
       bound = useChatStore.getState().sessions[tabId];
     }
-    if (!bound?.acpAgentId || !bound.acpSessionId) {
+    // `resumePending` is the resume-path equivalent of "not bound yet": the
+    // transcript has painted from disk but the agent spawn + ACP `session/load`
+    // haven't landed, so the optimistic `acpSessionId` points at a session the
+    // manager hasn't installed. Queue rather than send into the void.
+    if (!bound?.acpAgentId || !bound.acpSessionId || bound.resumePending) {
       useChatStore.getState().actions.enqueueMessage(tabId, actualContent);
       return;
     }

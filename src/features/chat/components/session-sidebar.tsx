@@ -32,7 +32,6 @@ import {
   type ClaudeSessionMeta,
 } from "../lib/claude-api";
 import {
-  agents,
   ensureAgent,
   getAgentSync,
   CODEX_PLUGIN_ID,
@@ -41,7 +40,7 @@ import {
 } from "../lib/agents-api";
 import { AtlasIcon } from "@/components/atlas-icon";
 import { useRecentChatsStore } from "@/features/workspaces/stores/recent-chats-store";
-import { snapshotMessageToWire } from "../lib/snapshot-message";
+import { resumeSessionFast, ResumeError } from "../lib/resume-session";
 
 /** Compact token count: 1234 → "1.2k", 1_200_000 → "1.2M". */
 function formatTokenCount(n: number): string {
@@ -194,6 +193,7 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
     clearSession,
     setSessionTitle,
     setTranscriptLoading,
+    setResumePending,
     createSession,
     hydrateSessionSnapshot,
   } = useChatStore.use.actions();
@@ -672,6 +672,11 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
     if (cachedAgent) {
       setAcpBinding(targetTabId, cachedAgent.agent_id, item.id, cwd);
     }
+    // The binding above is a GUESS — the backend hasn't loaded this session yet.
+    // Flag it so a send during the resume window queues instead of firing at a
+    // session the manager doesn't have (the transcript now paints well before
+    // the load lands, so this window is user-visible).
+    setResumePending(targetTabId, true);
     // Always flag loading at this point — the chat panel renders a spinner
     // instead of the welcome state until the snapshot lands. On a Rust-cache
     // hit the snapshot returns in ~1ms so the spinner is barely visible; on
@@ -692,71 +697,63 @@ export function SessionSidebar({ tabId }: SessionSidebarProps) {
       await Promise.resolve();
       if (isStale()) return;
 
-      let agent;
+      // Two-stage resume (`resumeSessionFast`): the transcript is read off disk
+      // and painted immediately (~50ms even on a 34MB JSONL), while the agent
+      // spawn + ACP `session/load` — the part that actually costs seconds — runs
+      // concurrently and only gates SENDING, not reading.
+      //
+      // atlas-agents still owns the cache: `loadSession` is idempotent, so the
+      // second visit to the same session is a `DashMap::get` away from instant,
+      // with no JSONL replay and no ACP round-trip.
+      let agent, snapshot;
       try {
-        agent = await ensureAgent(pluginId);
+        ({ agent, snapshot } = await resumeSessionFast({
+          pluginId,
+          sessionId: item.id,
+          cwd,
+          ensure: () => ensureAgent(pluginId),
+          cb: {
+            paint: (msgs) => replaceMessages(targetTabId, msgs),
+            onPainted: () => setTranscriptLoading(targetTabId, false),
+            isStale,
+          },
+        }));
       } catch (err) {
-        if (!isStale()) {
-          setTranscriptLoading(targetTabId, false);
-          toast.error(
-            `Agent not available: ${err instanceof Error ? err.message : String(err)}`
-          );
-        }
-        return;
-      }
-      if (isStale()) return;
-
-      // atlas-agents owns the cache. `loadSession` is idempotent: the second
-      // visit to the same session is a `DashMap::get` away from instant —
-      // no JSONL replay, no ACP round-trip. First visit replays the JSONL
-      // into a `SessionState` inside the manager and tells the agent to
-      // resume; that state stays loaded for the rest of the process.
-      let key;
-      try {
-        key = await agents.loadSession(agent.agent_id, item.id, cwd);
-      } catch (err) {
+        // Stale means a NEWER click owns this tab — and it has already set its
+        // own `resumePending`. Bail without touching the flag; clearing it here
+        // would un-gate the newer resume. Otherwise clear it, so a failed resume
+        // never leaves the tab silently queueing every future send.
         if (isStale()) return;
-        // Don't silently fork a NEW persisted session here — the clicked file
-        // stays on disk and the fork lists as a second history row for what
-        // the user experiences as one conversation. Surface the failure and
-        // ROLL BACK the optimistic binding set before the load: leaving
-        // `acpSessionId` pointing at a session the backend never loaded would
-        // block the chat panel's bind effect (it early-returns when a binding
-        // exists) and strand the tab. Clearing re-arms the normal new-session
-        // flow if the user keeps typing.
-        console.warn("loadSession failed:", err);
-        clearSession(targetTabId);
+        setResumePending(targetTabId, false);
+        const stage = err instanceof ResumeError ? err.stage : "load";
+        const msg = err instanceof Error ? err.message : String(err);
         setTranscriptLoading(targetTabId, false);
-        toast.error(
-          `Couldn't resume this session: ${
-            err instanceof Error
-              ? err.message.slice(0, 120)
-              : String(err).slice(0, 120)
-          }`
-        );
-        return;
-      }
-      if (isStale()) return;
-
-      // Pull the rich state Rust holds for this session and hydrate the
-      // chat-store from it. On a cache hit this is ~1ms; on a miss it
-      // already has the JSONL-replayed messages baked in.
-      let snapshot;
-      try {
-        snapshot = await agents.snapshot(key);
-      } catch (err) {
-        if (!isStale()) {
-          setTranscriptLoading(targetTabId, false);
-          toast.error(
-            `Couldn't load session: ${err instanceof Error ? err.message : String(err)}`
-          );
+        if (stage === "spawn") {
+          toast.error(`Agent not available: ${msg}`);
+        } else if (stage === "load") {
+          // Don't silently fork a NEW persisted session here — the clicked file
+          // stays on disk and the fork lists as a second history row for what
+          // the user experiences as one conversation. Surface the failure and
+          // ROLL BACK the optimistic binding set before the load: leaving
+          // `acpSessionId` pointing at a session the backend never loaded would
+          // block the chat panel's bind effect (it early-returns when a binding
+          // exists) and strand the tab. Clearing re-arms the normal new-session
+          // flow if the user keeps typing.
+          console.warn("loadSession failed:", err);
+          clearSession(targetTabId);
+          toast.error(`Couldn't resume this session: ${msg.slice(0, 120)}`);
+        } else {
+          toast.error(`Couldn't load session: ${msg}`);
         }
         return;
       }
+      // Same as the catch: a newer click owns the flag, so leave it alone.
       if (isStale()) return;
 
-      replaceMessages(targetTabId, snapshot.messages.map(snapshotMessageToWire));
       setAcpBinding(targetTabId, agent.agent_id, item.id, cwd);
+      // Backend now holds the session — sends may go straight through, and the
+      // drain effect flushes anything the user queued while resuming.
+      setResumePending(targetTabId, false);
       // Restore live status + docked plan AFTER the bind (which clears the
       // plan): switching back to a still-running session re-shows its plan.
       hydrateSessionSnapshot(targetTabId, snapshot.status, snapshot.plan);

@@ -176,6 +176,41 @@ impl AgentManager {
         Ok(key)
     }
 
+    /// Read a saved session's transcript straight off disk, WITHOUT spawning an
+    /// agent, issuing `acp.load_session`, or installing a `SessionState`.
+    ///
+    /// This exists purely to make session-open feel instant. `load_session`
+    /// below computes exactly these messages in its first few milliseconds and
+    /// then blocks for seconds on the agent handshake + `session/load` replay —
+    /// so the UI used to stare at a skeleton while the content it wanted was
+    /// already in memory. The frontend now calls this first to paint the thread,
+    /// and runs the real `load_session` concurrently to make the session
+    /// sendable. Measured on a 34 MB / 6.7k-line Claude transcript: ~42 ms here
+    /// versus seconds for the full resume.
+    ///
+    /// Returns an empty vec for transcript-less plugins (Codex replays its
+    /// history over ACP during `session/load`, so there is nothing on disk for
+    /// Atlas to read) — callers treat that as "no fast path, wait for the real
+    /// load" rather than as an error.
+    pub async fn replay_transcript(
+        &self,
+        plugin_id: &str,
+        cwd: &str,
+        session_id: &str,
+    ) -> Result<Vec<Message>> {
+        let plugin =
+            find_plugin(plugin_id).ok_or_else(|| Error::UnknownPlugin(plugin_id.to_string()))?;
+        match plugin.transcript {
+            TranscriptKind::None => Ok(Vec::new()),
+            TranscriptKind::CerseiJson => Ok(cersei_replay_to_messages(
+                self.inner.cersei.replay_session(cwd, session_id),
+            )),
+            TranscriptKind::ClaudeJsonl => {
+                transcript::replay(plugin.transcript, cwd, session_id).await
+            }
+        }
+    }
+
     /// Resume a previously-saved session; replays its transcript into the new
     /// `SessionState` so the UI sees full history immediately.
     ///

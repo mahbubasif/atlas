@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atlas_agents::{
-    AgentId, AgentInfo, AgentManager, AuthMethodWire, DeltaSink, OutboundMiddleware,
+    AgentId, AgentInfo, AgentManager, AuthMethodWire, DeltaSink, Message, OutboundMiddleware,
     OutboundPipeline, PermissionDecision, PluginSpec, SessionDelta, SessionDeltaEnvelope, SessionId,
     SessionKey, SessionSnapshot, SessionStatus,
 };
@@ -429,6 +429,25 @@ pub async fn agents_authenticate(
 ) -> Result<(), String> {
     manager
         .authenticate(agent_id, method_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Read a saved session's transcript off disk for an INSTANT first paint.
+///
+/// Deliberately agent-free: no spawn, no `session/load`, no `SessionState`. The
+/// frontend paints the returned messages immediately and runs the real
+/// `agents_load_session` concurrently to make the session sendable. Empty vec
+/// means "this plugin has no on-disk transcript" (Codex) — not an error.
+#[tauri::command]
+pub async fn agents_replay_transcript(
+    plugin_id: String,
+    session_id: String,
+    cwd: String,
+    manager: State<'_, AgentManager>,
+) -> Result<Vec<Message>, String> {
+    manager
+        .replay_transcript(&plugin_id, &cwd, &session_id)
         .await
         .map_err(|e| e.to_string())
 }
